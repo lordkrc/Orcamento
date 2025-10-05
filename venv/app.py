@@ -1,235 +1,199 @@
 import streamlit as st
-import pandas as pd
 import io
+import json
+import subprocess
+import sys
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
-from sqlalchemy.orm import Session
+from datetime import datetime
 
-# ---- BANCO DE DADOS ----
-from db import get_session
-from models import Estimate, LineItem, Orcamento
+# Importa as dependências do Firebase do arquivo firebase_client.py
+from firebase_client import install
 
-# Inicializa a sessão do banco de dados
-session: Session = next(get_session())
+# ---- INSTALAÇÃOa DE DEPENDÊNCIAS DO FIREBASE ----
+try:
+    from firebase_admin import credentials, firestore, initialize_app, auth
+except ImportError:
+    st.info("Instalando a biblioteca firebase-admin...")
+    install("firebase-admin")
+    from firebase_admin import credentials, firestore, initialize_app, auth
+
+# ---- FIREBASE & FIRESTORE SETUP ----
+db = None
+auth_client = None
+cred = None
+
+try:
+    if '__firebase_config' not in globals():
+        st.error("Variável de configuração do Firebase não encontrada. Verifique as configurações do ambiente.")
+    else:
+        firebase_config = json.loads(__firebase_config)
+        if isinstance(firebase_config, str):
+            firebase_config = json.loads(firebase_config)
+        cred = credentials.Certificate(firebase_config)
+except json.JSONDecodeError:
+    st.error("Erro ao decodificar a configuração do Firebase. A configuração não é um JSON válido.")
+except Exception as e:
+    st.error(f"Erro ao carregar a configuração do Firebase: {e}")
+
+if cred:
+    try:
+        initialize_app(cred)
+        db = firestore.client()
+        auth_client = auth
+    except ValueError:
+        st.info("Firebase já está inicializado.")
+        db = firestore.client()
+        auth_client = auth
+    except Exception as e:
+        st.error(f"Erro ao inicializar o Firebase: {e}")
 
 st.set_page_config(page_title="Estimador de Obras - MVP", layout="wide")
 
-# ---- ESTADO GLOBAL ----
-if 'items' not in st.session_state:
-    st.session_state['items'] = []
+# ---- GLOBAL STATE ----
+if 'show_download_buttons' not in st.session_state:
+    st.session_state['show_download_buttons'] = False
 
 st.title("🏗️ Estimador de Obras — MVP")
 
 # ---------------------------
-# Função para cálculo do reboco
+# Plaster calculation function
 # ---------------------------
-def calcular_reboco(comprimento, altura, espessura_cm, rendimento_saco, preco_saco, preco_mao_obra_m2, traco_areia=4):
+def calculate_plaster(length, height, sides, thickness_cm, yield_bag, bag_price, labor_price_m2, sand_ratio=4):
     """
-    Calcula os custos e materiais para o reboco de uma parede.
-
-    Args:
-        comprimento (float): Comprimento da parede em metros.
-        altura (float): Altura da parede em metros.
-        espessura_cm (float): Espessura do reboco em centímetros.
-        rendimento_saco (float): Rendimento de um saco de cimento em m².
-        preco_saco (float): Preço de um saco de cimento.
-        preco_mao_obra_m2 (float): Preço da mão de obra por m².
-        traco_areia (int, optional): Traço de areia em relação ao cimento. Padrão para 4.
-
-    Returns:
-        dict: Um dicionário com todos os resultados do cálculo.
+    Calculates the costs and materials for wall plaster.
     """
-    area = comprimento * altura
-    espessura_m = espessura_cm / 100
-    volume = area * espessura_m
+    area = length * height * sides
+    thickness_m = thickness_cm / 100
+    volume = area * thickness_m
 
-    sacos_cimento = area / rendimento_saco
-    custo_cimento = sacos_cimento * preco_saco
+    cement_bags = area / yield_bag
+    cement_cost = cement_bags * bag_price
 
-    volume_cimento = sacos_cimento * 0.035  # 0.035 m³ por saco
-    volume_areia = volume_cimento * traco_areia
+    cement_volume = cement_bags * 0.035
+    sand_volume = cement_volume * sand_ratio
 
-    custo_mao_obra = area * preco_mao_obra_m2
+    labor_cost = area * labor_price_m2
 
     return {
         "area": area,
         "volume": volume,
-        "sacos_cimento": sacos_cimento,
-        "custo_cimento": custo_cimento,
-        "volume_areia": volume_areia,
-        "custo_mao_obra": custo_mao_obra,
-        "custo_total": custo_cimento + custo_mao_obra
+        "cement_bags": cement_bags,
+        "cement_cost": cement_cost,
+        "sand_volume": sand_volume,
+        "labor_cost": labor_cost,
+        "total_cost": cement_cost + labor_cost
     }
 
 # ---------------------------
-# Interface Streamlit do Reboco
+# Streamlit Interface
 # ---------------------------
-st.subheader("🧱 Cálculo de Reboco de Muro")
+st.subheader("🧱 Cálculo de Reboco de Parede")
 
-comprimento = st.number_input("Comprimento do muro (m)", value=8.0, step=0.5)
-altura = st.number_input("Altura do muro (m)", value=2.2, step=0.1)
-espessura = st.number_input("Espessura do reboco (cm)", value=2.0, step=0.5)
-rendimento = st.number_input("Rendimento por saco de cimento (m²)", value=4.5, step=0.1)
-preco_saco = st.number_input("Preço do saco de cimento (R$)", value=35.0, step=1.0)
-preco_mao_obra = st.number_input("Preço da mão de obra por m² (R$)", value=25.0, step=1.0)
+length = st.number_input("Comprimento da parede (m)", value=8.0, step=0.5)
+height = st.number_input("Altura da parede (m)", value=2.2, step=0.1)
+sides = st.selectbox(
+    "Lados a serem rebocados",
+    options=[1, 2],
+    format_func=lambda x: "Apenas um lado" if x == 1 else "Ambos os lados"
+)
+thickness = st.number_input("Espessura do reboco (cm)", value=2.0, step=0.5)
+yield_rate = st.number_input("Rendimento do saco de cimento (m²)", value=4.5, step=0.1)
+bag_price = st.number_input("Preço do saco de cimento (R$)", value=35.0, step=1.0)
+labor_price = st.number_input("Preço da mão de obra por m² (R$)", value=25.0, step=1.0)
 
 if st.button("Calcular Reboco"):
-    resultado = calcular_reboco(comprimento, altura, espessura, rendimento, preco_saco, preco_mao_obra)
+    result = calculate_plaster(length, height, sides, thickness, yield_rate, bag_price, labor_price)
 
-    st.success(f"Área Total: **{resultado['area']:.2f} m²**")
-    st.write(f"Volume de Reboco: **{resultado['volume']:.3f} m³**")
-    st.write(f"Sacos de Cimento: **{resultado['sacos_cimento']:.1f} sacos** (R$ {resultado['custo_cimento']:.2f})")
-    st.write(f"Volume de Areia: **{resultado['volume_areia']:.3f} m³**")
-    st.write(f"Custo de Mão de Obra: **R$ {resultado['custo_mao_obra']:.2f}**")
-    st.markdown(f"### 💰 Custo Total Estimado: R$ {resultado['custo_total']:.2f}")
+    st.success(f"Área Total: **{result['area']:.2f} m²**")
+    st.write(f"Volume de Reboco: **{result['volume']:.3f} m³**")
+    st.write(f"Sacos de Cimento: **{result['cement_bags']:.1f} sacos** (R$ {result['cement_cost']:.2f})")
+    st.write(f"Volume de Areia: **{result['sand_volume']:.3f} m³**")
+    st.write(f"Custo da Mão de Obra: **R$ {result['labor_cost']:.2f}**")
+    st.markdown(f"### 💰 Custo Total Estimado: R$ {result['total_cost']:.2f}")
 
-    # Opção de salvar no banco de dados
-    if st.button("💾 Salvar Orçamento de Reboco no Banco"):
-        novo_orcamento = Orcamento(
-            descricao=f"Reboco de muro ({comprimento}x{altura}m)",
-            valor=resultado['custo_total']
-        )
-        session.add(novo_orcamento)
-        session.commit()
-        st.success("✅ Orçamento de Reboco salvo com sucesso!")
+    if st.button("💾 Salvar Estimativa no Banco de Dados"):
+        if not db:
+            st.error("Não é possível salvar. Banco de dados não disponível.")
+        else:
+            user_id = "default_user"
+            app_id = __app_id if '__app_id' in globals() else 'default_app_id'
+            
+            try:
+                estimate_ref = db.collection(f"artifacts/{app_id}/users/{user_id}/estimates").add({
+                    "user_id": user_id,
+                    "description": f"Reboco de parede ({length}x{height}m)",
+                    "value": result['total_cost'],
+                    "created_at": datetime.utcnow(),
+                    "details": result
+                })
+                st.success(f"✅ Estimativa salva com sucesso! ID: {estimate_ref[1].id}")
+                st.session_state['show_download_buttons'] = True
+            except Exception as e:
+                st.error(f"Erro ao salvar a estimativa: {e}")
 
-st.markdown("---")
-
-# ---- BARRA LATERAL (CONFIGURAÇÕES) ----
-with st.sidebar:
-    st.header("Configurações")
-    st.session_state['labor_rate'] = st.number_input("Valor por hora de mão-de-obra (R$)", value=25.0, step=1.0)
-    st.session_state['tax_pct'] = st.number_input("Imposto (%)", value=0.0, step=0.1)
-    st.session_state['overhead_pct'] = st.number_input("Despesas/Overhead (%)", value=10.0, step=0.1)
-    st.session_state['profit_pct'] = st.number_input("Margem de Lucro (%)", value=10.0, step=0.1)
-
-# ---- FORMULÁRIO DE ITENS ----
-with st.form("adiciona_item"):
-    st.subheader("Adicionar Item ao Orçamento")
-    desc = st.text_input("Descrição")
-    qty = st.number_input("Quantidade", min_value=0.0, value=1.0, step=0.1)
-    unit = st.text_input("Unidade", value="un")
-    unit_price = st.number_input("Preço Unitário (R$)", min_value=0.0, value=0.0, step=0.1)
-    labor_hours = st.number_input("Horas de Mão de Obra por Unidade", min_value=0.0, value=0.0, step=0.1)
-    add = st.form_submit_button("Adicionar Item")
-    if add:
-        st.session_state['items'].append({
-            "desc": desc,
-            "qty": float(qty),
-            "unit": unit,
-            "unit_price": float(unit_price),
-            "labor_hours": float(labor_hours)
-        })
-
-# ---- EXIBE ITENS ----
-if st.session_state['items']:
-    df = pd.DataFrame(st.session_state['items'])
-    df['material_cost'] = df['qty'] * df['unit_price']
-    df['labor_cost'] = df['qty'] * df['labor_hours'] * st.session_state['labor_rate']
-    df['subtotal'] = df['material_cost'] + df['labor_cost']
-
-    st.subheader("Itens Adicionados")
-    df_display = df.rename(columns={
-        'desc': 'Descrição',
-        'qty': 'Quantidade',
-        'unit': 'Unidade',
-        'unit_price': 'Preço Unitário',
-        'labor_hours': 'Horas de Mão de Obra',
-        'material_cost': 'Custo de Material',
-        'labor_cost': 'Custo de Mão de Obra',
-        'subtotal': 'Subtotal'
-    })
-    st.dataframe(df_display[['Descrição','Quantidade','Unidade','Preço Unitário','Horas de Mão de Obra','Custo de Material','Custo de Mão de Obra','Subtotal']],
-                 use_container_width=True)
-
-    # ---- CÁLCULOS ----
-    subtotal = float(df['subtotal'].sum())
-    overhead = subtotal * (st.session_state['overhead_pct']/100)
-    profit = subtotal * (st.session_state['profit_pct']/100)
-    tax = (subtotal + overhead + profit) * (st.session_state['tax_pct']/100)
-    total = subtotal + overhead + profit + tax
-
-    st.markdown(f"**Subtotal:** R$ {subtotal:,.2f}")
-    st.markdown(f"**Overhead ({st.session_state['overhead_pct']}%):** R$ {overhead:,.2f}")
-    st.markdown(f"**Lucro ({st.session_state['profit_pct']}%):** R$ {profit:,.2f}")
-    st.markdown(f"**Imposto ({st.session_state['tax_pct']}%):** R$ {tax:,.2f}")
-    st.markdown(f"### 💰 Total: R$ {total:,.2f}")
-
-    # ---- BOTÃO DE SALVAR NO BANCO ----
-    if st.button("💾 Salvar Orçamento no Banco"):
-        estimate = Estimate(client="Cliente Padrão")
-        session.add(estimate)
-        session.commit()
-
-        for row in df.to_dict(orient="records"):
-            item = LineItem(
-                estimate_id=estimate.id,
-                description=row['desc'],
-                qty=row['qty'],
-                unit=row['unit'],
-                unit_price=row['unit_price'],
-                labor_hours=row['labor_hours']
-            )
-            session.add(item)
-        session.commit()
-        st.success(f"✅ Orçamento salvo com ID {estimate.id}")
-        st.session_state['items'] = []
-
-    # ---- DOWNLOAD CSV ----
-    csv = df.to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Baixar Itens (CSV)", data=csv, file_name="itens.csv", mime="text/csv")
-
-    # ---- DOWNLOAD PDF ----
-    def create_pdf_bytes(df, subtotal, overhead, profit, tax, total):
-        buffer = io.BytesIO()
-        c = canvas.Canvas(buffer, pagesize=A4)
-        x, y = 50, 800
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(x, y, "Orçamento de Obra — MVP")
-        y -= 30
-        c.setFont("Helvetica", 10)
-        for idx, row in df.iterrows():
-            text = f"{idx+1}. {row['desc']} — {row['qty']}{row['unit']} x R$ {row['unit_price']:.2f} — {row['labor_hours']}h/un"
-            c.drawString(x, y, text)
+    if st.session_state.get('show_download_buttons'):
+        
+        # ---- DOWNLOAD DE PDF ----
+        def create_pdf_bytes_plaster(result):
+            buffer = io.BytesIO()
+            c = canvas.Canvas(buffer, pagesize=A4)
+            x, y = 50, 800
+            c.setFont("Helvetica-Bold", 14)
+            c.drawString(x, y, "Estimativa de Obra — Reboco")
+            y -= 30
+            c.setFont("Helvetica", 10)
+            c.drawString(x, y, f"Área Total: {result['area']:.2f} m²")
             y -= 15
-            if y < 80:
-                c.showPage()
-                y = 800
-        y -= 10
-        c.drawString(x, y, f"Subtotal: R$ {subtotal:,.2f}")
-        y -= 15
-        c.drawString(x, y, f"Despesas/Overhead: R$ {overhead:,.2f}")
-        y -= 15
-        c.drawString(x, y, f"Lucro: R$ {profit:,.2f}")
-        y -= 15
-        c.drawString(x, y, f"Impostos: R$ {tax:,.2f}")
-        y -= 20
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(x, y, f"Total: R$ {total:,.2f}")
-        c.save()
-        buffer.seek(0)
-        return buffer.getvalue()
+            c.drawString(x, y, f"Volume de Reboco: {result['volume']:.3f} m³")
+            y -= 15
+            c.drawString(x, y, f"Sacos de Cimento: **{result['cement_bags']:.1f} sacos** (R$ {result['cement_cost']:.2f})")
+            y -= 15
+            c.drawString(x, y, f"Volume de Areia: **{result['sand_volume']:.3f} m³**")
+            y -= 15
+            c.drawString(x, y, f"Custo da Mão de Obra: **R$ {result['labor_cost']:.2f}**")
+            y -= 20
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(x, y, f"Custo Total Estimado: R$ {result['total_cost']:.2f}")
+            c.save()
+            buffer.seek(0)
+            return buffer.getvalue()
 
-    pdf_bytes = create_pdf_bytes(df, subtotal, overhead, profit, tax, total)
-    st.download_button("📄 Baixar Orçamento (PDF)", data=pdf_bytes, file_name="orcamento.pdf", mime="application/pdf")
+        pdf_bytes = create_pdf_bytes_plaster(result)
+        st.download_button("📄 Baixar Estimativa em PDF", data=pdf_bytes, file_name="plaster_estimate.pdf", mime="application/pdf")
 
-# ---- HISTÓRICO DE ORÇAMENTOS ----
+# ---- HISTÓRICO DE ORÇAMENTOS SALVOS ----
 st.subheader("📜 Orçamentos Salvos")
-estimates = session.query(Estimate).all()
-orcamentos = session.query(Orcamento).all()
 
-if estimates or orcamentos:
-    for e in estimates:
-        with st.expander(f"Orçamento Geral #{e.id} - {e.created_at.strftime('%d/%m/%Y %H:%M')}"):
-            st.markdown(f"**Cliente:** {e.client}")
-            data = [[item.description, item.qty, item.unit, item.unit_price, item.labor_hours] for item in e.items]
-            df_items = pd.DataFrame(data, columns=["Descrição", "Qtd", "Unidade", "Preço Unitário", "Horas Mão de Obra"])
-            st.dataframe(df_items, use_container_width=True)
-
-    for o in orcamentos:
-        with st.expander(f"Orçamento de Reboco #{o.id} - {o.created_at.strftime('%d/%m/%Y %H:%M')}"):
-            st.write(f"**Descrição:** {o.descricao}")
-            st.write(f"**Valor:** R$ {o.valor:.2f}")
-
+if not db:
+    st.warning("Não é possível exibir os orçamentos. Banco de dados não disponível.")
 else:
-    st.info("Nenhum orçamento foi salvo ainda.")
+    user_id = "default_user"
+    app_id = __app_id if '__app_id' in globals() else 'default_app_id'
+
+    try:
+        estimates_stream = db.collection(f"artifacts/{app_id}/users/{user_id}/estimates").stream()
+        estimates = [doc.to_dict() for doc in estimates_stream]
+    
+        if estimates:
+            for e in estimates:
+                created_at = e.get('created_at', datetime.utcnow())
+                if hasattr(created_at, 'strftime'):
+                    created_at_str = created_at.strftime('%d/%m/%Y %H:%M')
+                else:
+                    created_at_str = "N/A"
+                
+                with st.expander(f"Estimativa de Reboco - {created_at_str}"):
+                    st.write(f"**Descrição:** {e['description']}")
+                    st.write(f"**Valor:** R$ {e['value']:.2f}")
+                    if 'details' in e:
+                        st.subheader("Detalhes")
+                        st.write(f"Área Total: **{e['details']['area']:.2f} m²**")
+                        st.write(f"Volume de Reboco: **{e['details']['volume']:.3f} m³**")
+                        st.write(f"Sacos de Cimento: **{e['details']['cement_bags']:.1f} sacos** (R$ {e['details']['cement_cost']:.2f})")
+                        st.write(f"Volume de Areia: **{e['details']['sand_volume']:.3f} m³**")
+                        st.write(f"Custo da Mão de Obra: **R$ {e['details']['labor_cost']:.2f}**")
+        else:
+            st.info("Nenhuma estimativa foi salva ainda.")
+    except Exception as e:
+        st.error(f"Erro ao carregar as estimativas: {e}")
