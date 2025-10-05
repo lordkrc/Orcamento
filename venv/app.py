@@ -11,12 +11,7 @@ from datetime import datetime
 from firebase_client import install
 
 # ---- INSTALAÇÃOa DE DEPENDÊNCIAS DO FIREBASE ----
-try:
-    from firebase_admin import credentials, firestore, initialize_app, auth
-except ImportError:
-    st.info("Instalando a biblioteca firebase-admin...")
-    install("firebase-admin")
-    from firebase_admin import credentials, firestore, initialize_app, auth
+from firebase_admin import credentials, firestore, initialize_app, auth
 
 # ---- FIREBASE & FIRESTORE SETUP ----
 db = None
